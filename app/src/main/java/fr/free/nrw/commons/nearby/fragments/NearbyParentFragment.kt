@@ -250,6 +250,11 @@ class NearbyParentFragment : CommonsDaggerSupportFragment(),
     @Volatile
     private var stopQuery = false
     private var drawableCache: MutableMap<Pair<Context, Int>, Drawable>? = null
+    
+    // Timeout tracking for super-popular items
+    // Tracks individual pin requests to distinguish between super-popular items and server issues
+    private var totalPinRequests = 0
+    private var timeoutPinRequests = 0
 
     // Explore map data (for if we came from Explore)
     private var prevZoom = 0.0
@@ -1324,6 +1329,10 @@ class NearbyParentFragment : CommonsDaggerSupportFragment(),
      *
      */
     private fun emptyCache() {
+        // Reset timeout tracking when clearing cache
+        totalPinRequests = 0
+        timeoutPinRequests = 0
+        
         // reload the map once the cache is cleared
         compositeDisposable.add(
             placesRepository!!.clearCache()
@@ -1518,6 +1527,8 @@ class NearbyParentFragment : CommonsDaggerSupportFragment(),
      * @param isBookMarked A boolean indicating if the place is bookmarked.
      */
     private fun getPlaceData(entity: String?, place: Place, marker: Marker, isBookMarked: Boolean) {
+        totalPinRequests++
+        
         val getPlaceObservable = Observable
             .fromCallable {
                 nearbyController?.getPlaces(java.util.List.of(place))
@@ -1555,12 +1566,100 @@ class NearbyParentFragment : CommonsDaggerSupportFragment(),
                     },
                     { throwable: Throwable ->
                         Timber.d(throwable)
+                        
+                        // Handle timeouts/rate-limits from super-popular items
+                        // When tapping a pin, if it times out, it's likely a super-popular item that already has P18
+                        // This is acceptable because super-popular items are more likely to have images already
+                        val isTimeoutOrRateLimit = isTimeoutOrRateLimitException(throwable)
+                        
+                        if (isTimeoutOrRateLimit) {
+                            timeoutPinRequests++
+                            
+                            // minority timeouts = super-popular items, majority = server issue
+                            val shouldTreatAsSuperPopular = shouldTreatTimeoutAsSuperPopular()
+                            
+                            if (shouldTreatAsSuperPopular) {
+                                markPlaceAsSuperPopular(place, marker, isBookMarked)
+                                return@subscribe
+                            }
+                        }
+                        
+                        // Show error for non-timeout exceptions or widespread server issues
                         showErrorMessage(
                             getString(fr.free.nrw.commons.R.string.could_not_load_place_data)
                                 + throwable.localizedMessage
                         )
                     })
         )
+    }
+
+    /**
+     * Distinguish between super-popular items and server issues.
+     * 
+     * Logic: If only a minority of pins time out, they're likely super-popular items.
+     * If most pins time out, it's likely a server issue.
+     * 
+     * Conservative approach: Only treat as server issue with overwhelming evidence (80%+ timeouts).
+     */
+    private fun shouldTreatTimeoutAsSuperPopular(): Boolean {
+        if (totalPinRequests <= 0) return true
+        if (totalPinRequests <= 3) return true // Small samples always treated as super-popular
+        
+        val timeoutRatio = timeoutPinRequests.toDouble() / totalPinRequests.toDouble()
+        
+        // Only show error if overwhelming evidence of server issue
+        val isLikelyServerIssue = totalPinRequests >= 4 && timeoutRatio >= 0.8
+        
+        return !isLikelyServerIssue
+    }
+
+    /**
+     * Detects timeout and rate-limit exceptions that indicate super-popular items.
+     */
+    private fun isTimeoutOrRateLimitException(throwable: Throwable): Boolean {
+        return when {
+            throwable is java.net.SocketTimeoutException -> true
+            throwable is java.util.concurrent.TimeoutException -> true
+            throwable is java.io.IOException && (
+                throwable.message?.contains("timeout", ignoreCase = true) == true ||
+                throwable.message?.contains("429", ignoreCase = true) == true || // Rate limit
+                throwable.message?.contains("504", ignoreCase = true) == true || // Gateway timeout
+                throwable.message?.contains("Unexpected response code: 429", ignoreCase = true) == true ||
+                throwable.message?.contains("Unexpected response code: 504", ignoreCase = true) == true
+            ) -> true
+            throwable.cause?.let { isTimeoutOrRateLimitException(it) } == true -> true
+            else -> false
+        }
+    }
+
+    /**
+     * Marks a place as successful (green) when timeout suggests it's a super-popular item.
+     * 
+     * Why this is acceptable: Super-popular items are more likely to already
+     * have P18 images, so showing them as green (successful) is reasonable. When the user taps
+     * the pin, the UI will still attempt to show P18 if available, or show basic info if not.
+     */
+    private fun markPlaceAsSuperPopular(place: Place, marker: Marker, isBookMarked: Boolean) {
+        marker.title = if (place.name.isNotEmpty()) place.name else "Popular Place"
+        marker.snippet = place.longDescription ?: "This appears to be a popular item"
+        marker.showInfoWindow()
+        
+        // Mark as green (successful state) - assumes P18 likely exists for popular items
+        val icon = getDrawable(
+            requireContext(),
+            getIconFor(place, isBookMarked)
+        )
+        marker.icon = icon
+        binding!!.map.invalidate()
+        
+        // Update UI to show successful state
+        binding!!.bottomSheetDetails.dataCircularProgress.visibility = View.GONE
+        binding!!.bottomSheetDetails.icon.visibility = View.VISIBLE
+        binding!!.bottomSheetDetails.wikiDataLl.visibility = View.VISIBLE
+        passInfoToSheet(place)
+        hideBottomSheet()
+        
+        savePlaceToDatabase(place)
     }
 
     private fun populatePlacesForCurrentLocation(
@@ -1705,6 +1804,10 @@ class NearbyParentFragment : CommonsDaggerSupportFragment(),
         nearbyPlaces: List<Place>, curLatLng: LatLng,
         shouldUpdateSelectedMarker: Boolean
     ) {
+        // Reset timeout tracking for new batch of places
+        totalPinRequests = 0
+        timeoutPinRequests = 0
+        
         presenter!!.updateMapMarkers(nearbyPlaces, curLatLng, scope)
     }
 
